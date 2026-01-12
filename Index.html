@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Ferro.scan 🧲</title>
+    <style>
+        :root { --bg: #111; --text: #eee; --accent: #ff4757; --safe: #2ed573; }
+        body {
+            background: var(--bg); color: var(--text);
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; height: 100vh; margin: 0; overflow: hidden;
+            touch-action: none; /* Prevent scroll on drag */
+        }
+        h1 { margin: 0 0 10px 0; font-weight: 300; letter-spacing: 2px; }
+        .readout { font-size: 3rem; font-variant-numeric: tabular-nums; font-weight: bold; }
+        .unit { font-size: 1rem; color: #888; }
+        
+        /* The Gauge Visualizer */
+        #gauge {
+            width: 300px; height: 300px;
+            border-radius: 50%;
+            background: radial-gradient(circle, #222 0%, #000 70%);
+            border: 2px solid #333;
+            display: flex; align-items: center; justify-content: center;
+            margin: 20px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            transition: box-shadow 0.1s;
+        }
+        #core {
+            width: 200px; height: 200px;
+            border-radius: 50%;
+            border: 5px solid var(--safe);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            transition: border-color 0.1s, transform 0.1s;
+        }
+        
+        .controls { display: flex; gap: 10px; margin-top: 20px; }
+        button {
+            background: #333; border: 1px solid #555; color: white;
+            padding: 10px 20px; border-radius: 8px; font-size: 1rem;
+            cursor: pointer;
+        }
+        button:active { background: #555; }
+        button.active { background: var(--safe); color: black; border-color: var(--safe); }
+        
+        .status { margin-top: 15px; font-size: 0.8rem; color: #666; }
+        
+        /* High detection state */
+        body.high-alert #core { border-color: var(--accent); transform: scale(1.1); }
+        body.high-alert #gauge { box-shadow: 0 0 50px var(--accent); }
+    </style>
+</head>
+<body>
+
+    <h1>FERRO.SCAN</h1>
+    
+    <div id="gauge">
+        <div id="core">
+            <div class="readout" id="val">0</div>
+            <div class="unit">µT (Microtesla)</div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="btnInit">Start Sensor</button>
+        <button id="btnTare">Tare (Zero)</button>
+    </div>
+    
+    <div class="status" id="status">Ready to scan.</div>
+
+    <script>
+        // --- CONFIG ---
+        const THRESHOLD_HIGH = 150; // µT value to trigger red alert
+        let magSensor = null;
+        let baseline = 0; // The "Tare" value
+        let currentField = 0;
+        
+        // Audio Context for Geiger sound
+        let audioCtx;
+        let lastClickTime = 0;
+
+        // --- DOM ---
+        const valDisplay = document.getElementById('val');
+        const statusDisplay = document.getElementById('status');
+        const core = document.getElementById('core');
+        const body = document.body;
+
+        document.getElementById('btnInit').addEventListener('click', initSensor);
+        document.getElementById('btnTare').addEventListener('click', () => {
+            baseline = currentField;
+            statusDisplay.textContent = "Baseline set to " + baseline.toFixed(1) + " µT";
+        });
+
+        async function initSensor() {
+            // 1. Audio Init
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if(audioCtx.state === 'suspended') audioCtx.resume();
+
+            // 2. Sensor Init
+            if ('Magnetometer' in window) {
+                try {
+                    // Request permission (if API requires it in future)
+                    const result = await navigator.permissions.query({ name: 'magnetometer' });
+                    if (result.state === 'denied') {
+                        statusDisplay.textContent = "Permission denied.";
+                        return;
+                    }
+
+                    magSensor = new Magnetometer({ frequency: 60 });
+                    magSensor.addEventListener('reading', onReading);
+                    magSensor.addEventListener('error', (event) => {
+                        statusDisplay.textContent = "Sensor Error: " + event.error.name;
+                    });
+                    magSensor.start();
+                    statusDisplay.textContent = "Sensor Active. Scanning...";
+                    document.getElementById('btnInit').style.display = 'none';
+                } catch (err) {
+                    statusDisplay.textContent = "Error: " + err.message;
+                }
+            } else {
+                statusDisplay.innerHTML = "❌ Magnetometer API not supported on this device/browser.<br>Try Chrome on Android.";
+                // Fallback: Simulation mode for testing UI
+                startSimulation(); 
+            }
+        }
+
+        function onReading() {
+            // Calculate Total Magnetic Field Strength (magnitude of vector)
+            // x, y, z are in microteslas (µT)
+            const x = magSensor.x;
+            const y = magSensor.y;
+            const z = magSensor.z;
+            
+            const rawTotal = Math.sqrt(x*x + y*y + z*z);
+            currentField = rawTotal;
+            
+            updateUI(rawTotal - baseline);
+        }
+
+        function updateUI(value) {
+            // Display absolute value (magnitude of difference)
+            const absVal = Math.abs(value);
+            valDisplay.textContent = absVal.toFixed(1);
+
+            // Visual Feedback
+            if (absVal > 50) {
+                body.classList.add('high-alert');
+            } else {
+                body.classList.remove('high-alert');
+            }
+
+            // Audio Feedback (Geiger Click)
+            // The higher the value, the more frequent the clicks
+            // We map value (0 - 100) to an interval
+            if (absVal > 5) {
+                const now = audioCtx.currentTime;
+                // Max rate: 0.05s (very fast), Min rate: 0.5s (slow)
+                const rate = Math.max(0.05, 0.5 - (absVal / 200)); 
+                
+                if (now - lastClickTime > rate) {
+                    playClick(absVal);
+                    lastClickTime = now;
+                }
+            }
+        }
+
+        function playClick(intensity) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            osc.type = 'square';
+            // Pitch rises slightly with intensity
+            osc.frequency.value = 100 + (intensity * 2); 
+            
+            // Short "click" envelope
+            osc.start();
+            gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.05);
+            osc.stop(audioCtx.currentTime + 0.05);
+        }
+
+        // --- SIMULATION (For testing without hardware) ---
+        function startSimulation() {
+            statusDisplay.innerHTML += " <br><b>(Running Simulation Mode)</b>";
+            document.getElementById('btnInit').style.display = 'none';
+            
+            let simVal = 40;
+            setInterval(() => {
+                // Randomly drift
+                simVal += (Math.random() - 0.5) * 5;
+                // Occasional spike
+                if(Math.random() > 0.95) simVal += 50; 
+                if(simVal < 0) simVal = 0;
+                
+                currentField = simVal;
+                updateUI(simVal - baseline);
+            }, 100);
+        }
+    </script>
+</body>
+</html>
